@@ -7,6 +7,8 @@
 
 #define MSGLEN           16      // Length of a message
 
+#define SERBUFFLEN       80
+
 #define LED_INIT         0
 #define LED_ON           1
 #define LED_OFF          2
@@ -57,9 +59,22 @@ typedef struct
 // A message queue entry
 typedef struct
 {
-    void *nextMsg;
+    void *nextMsg; 
     unsigned char msg[MSGLEN];
 } msgType;
+
+typedef struct
+{
+    int end;
+    boolean gotCmd;
+    char buff[SERBUFFLEN];
+} serBuffType;
+
+typedef struct
+{
+    char *cmdName;
+    void (*cmdFn)(void);
+} shellCmdType;
 
 // The managed memory pool
 volatile memblockType memPool[MEMPOOL_SIZE];
@@ -74,6 +89,16 @@ processType *runningProcess;
 timerType *timerList;
 
 edosErrorType edosErrno;
+
+serBuffType serBuff;
+
+void edosShellPs();
+
+shellCmdType shellCmds[] =
+{
+    { "ps", edosShellPs },
+    { NULL, NULL }
+};
 
 unsigned long int ms;
 
@@ -93,6 +118,25 @@ void bspSerialInit()
 {
     Serial.begin(9600);
     delay(5000);
+}
+
+// Return true if there's something to read from serial port
+boolean bspSerialReady()
+{
+    if(Serial.available())
+    {
+        return true;
+    }
+    else
+    {
+        return false;
+    }
+}
+
+// Read next character from serial port
+char bspGetchar()
+{
+    return Serial.read();
 }
 
 // Print message on serial port, include PID of running process and newline
@@ -144,6 +188,93 @@ void bspInitGpio()
 //
 // Operating system functions
 //
+
+// Initialise shell process
+void edosInitShell()
+{
+    serBuff.end = 0;
+    serBuff.gotCmd = false;
+}
+
+// Shell process "ps" command
+void edosShellPs()
+{
+    processType *p;
+    char txtBuff[80];
+
+    p = processList;
+    while(p != NULL)
+    {
+        sprintf(txtBuff, "%8s 0x%08lx ", p -> procName, (unsigned long int)p);
+        if(p -> state == PROC_RUNNING)
+        {
+            strcat(txtBuff, "RUNNING");
+        }
+        else
+        {
+            strcat(txtBuff, "SUSPENDED");
+        }
+        bspPrintln(txtBuff);
+        p = p -> nextProc;
+    }
+}
+
+// Shell process
+// reads one character per schedule loop
+// executes command once a whole line is read in
+// commands run to completion before returning to scheduler
+// if command takes ages, it should be done as a state machine or start another process or similar to allow scheduler to run
+void edosShellProcess()
+{   
+    int c;
+    char inch;
+    char txtBuff[80];
+
+    if(serBuff.gotCmd == false)
+    {
+        if(bspSerialReady() == true)
+        {
+            inch = bspGetchar();
+            if(inch == '\n')
+            {
+                serBuff.buff[serBuff.end] = '\0';
+                serBuff.gotCmd = true;
+            }
+            else
+            {
+                if(isprint(inch))
+                {
+                    serBuff.buff[serBuff.end] = inch;
+                    serBuff.end++;
+                    if(serBuff.end == SERBUFFLEN)
+                    {
+                        serBuff.end = 0;
+                    }
+                }
+            }
+        }
+    }
+    else
+    {
+        c = 0;
+        while(shellCmds[c].cmdFn != NULL && strcmp(shellCmds[c].cmdName, serBuff.buff) != 0)
+        {
+            c++;    
+        }
+
+        if(shellCmds[c].cmdFn == NULL)
+        {
+            bspPrintln("Bad command");
+        }
+        else
+        {
+            shellCmds[c].cmdFn();
+        }
+
+        serBuff.end = 0;
+        serBuff.gotCmd = false;
+    }
+}
 
 // Timer handler - run from scheduler when at least OS_TICK ms have elapsed
 void edosHandleTimers()
@@ -539,7 +670,6 @@ void edosScheduler()
         ms = bspMilliseconds();
         edosHandleTimers();
     }
-
 }
 
 // OS Initialisation
@@ -558,9 +688,12 @@ void edosInit()
     // Initialise process list
     processList = (processType *)NULL;
 
+
     // Initialise memory pool
     edosFreeAll();
     edosShowMem();
+    
+    edosInitShell();
 }
 
 //
@@ -656,6 +789,7 @@ void sysInit()
     p = edosCreateProcess("LEDON", ledOnProcess, PROC_RUNNING);
     edosCreateProcess("LEDOFF", ledOffProcess, PROC_RUNNING);
     edosCreateProcess("LEDMAN", ledMgmtProcess, PROC_RUNNING);
+    edosCreateProcess("SHELL", edosShellProcess, PROC_RUNNING);
 
     bspPrintln("Running processes...");
 
